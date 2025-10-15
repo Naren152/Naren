@@ -1,0 +1,290 @@
+/* 
+  ESP32 Tamper Detection - Complete hardware configuration code
+  - HX711 (Load Cell)
+  - MPU6050
+  - Reed Switch (door)
+  - Vibration SW-420 (digital)
+  - Buzzer + Red/Green LEDs
+  - WiFi + HTTP POST alert to webhook
+  Pins are from your project document:
+    HX711 DT -> GPIO4
+    HX711 SCK-> GPIO5
+    MPU6050 SDA -> GPIO21, SCL -> GPIO22
+    Reed Switch -> GPIO13
+    Vibration -> GPIO14
+    Buzzer -> GPIO25
+    Red LED -> GPIO26
+    Green LED -> GPIO27
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "HX711.h"
+
+// ====== CONFIG ======
+const char* WIFI_SSID = "YOUR_SSID";
+const char* WIFI_PASS = "YOUR_PASSWORD";
+
+// Webhook or server to receive alerts (use https://webhook.site or your server)
+const char* WEBHOOK_URL = "https://example.com/your-webhook";
+
+// Sensor pins
+const int HX_DT_PIN = 4;
+const int HX_SCK_PIN = 5;
+const int REED_PIN   = 13;
+const int VIB_PIN    = 14;
+const int BUZZER_PIN = 25;
+const int RED_LED    = 26;
+const int GREEN_LED  = 27;
+
+// HX711 calibration - you must calibrate these for your loadcell
+float HX_SCALE = 2280.0;   // placeholder scale factor (change after calibration)
+long HX_TARE_OFFSET = 0;   // computed after tare
+
+// Detection thresholds (tweak after real testing)
+const float LOAD_CHANGE_THRESHOLD = 200.0; // units change that triggers alert (in hx units after get_units)
+const float MPU_ACCELERATION_THRESHOLD = 2.0; // m/s^2 above gravity (~9.8) to indicate strong movement
+const unsigned long ALERT_COOLDOWN_MS = 60UL * 1000UL; // minimum ms between alerts (rate-limiting)
+
+// Debounce/hysteresis
+const unsigned long REED_DEBOUNCE_MS = 50;
+const unsigned long VIB_DEBOUNCE_MS  = 50;
+
+// ====== GLOBALS ======
+HX711 scale;
+Adafruit_MPU6050 mpu;
+Preferences prefs;
+
+unsigned long lastAlertMillis = 0;
+float lastLoadValue = 0.0;
+
+unsigned long lastReedChange = 0;
+int lastReedState = HIGH; // assume closed pullup
+
+unsigned long lastVibChange = 0;
+int lastVibState = LOW;
+
+WiFiClient wifiClient;
+
+// ====== Helper functions ======
+void wifiConnect() {
+  Serial.print("Connecting to WiFi ");
+  Serial.print(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("WiFi connect failed.");
+  }
+}
+
+void sendAlert(const char* type, const String& details) {
+  unsigned long now = millis();
+  if (now - lastAlertMillis < ALERT_COOLDOWN_MS) {
+    Serial.println("Alert suppressed (cooldown).");
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Not connected to WiFi, attempting reconnect...");
+    wifiConnect();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Still not connected, aborting alert.");
+      return;
+    }
+  }
+
+  HTTPClient http;
+  Serial.print("Sending alert: ");
+  Serial.println(type);
+
+  String payload = "{";
+  payload += "\"device_id\":\"ESP32_TAMPER_01\",";
+  payload += "\"type\":\""; payload += type; payload += "\",";
+  payload += "\"details\":\""; payload += details; payload += "\"";
+  payload += "}";
+
+  http.begin(WiFi, WEBHOOK_URL);
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    Serial.printf("HTTP POST returned %d\n", httpCode);
+    String resp = http.getString();
+    Serial.println("Response: " + resp);
+  } else {
+    Serial.printf("HTTP POST failed, error: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
+
+  lastAlertMillis = now;
+}
+
+// Simple alarm routine: blink red LED and beep buzzer for duration ms
+void alarmLocal(unsigned long duration_ms = 2000) {
+  unsigned long start = millis();
+  while (millis() - start < duration_ms) {
+    digitalWrite(RED_LED, HIGH);
+    tone(BUZZER_PIN, 2000); // beep
+    delay(150);
+    digitalWrite(RED_LED, LOW);
+    noTone(BUZZER_PIN);
+    delay(150);
+  }
+  // After alarm, set green LED based on normal/standby
+  digitalWrite(GREEN_LED, HIGH);
+}
+
+float readLoadUnits(int samples = 10) {
+  // returns average units from HX711 (scale.get_units)
+  double sum = 0;
+  int count = 0;
+  for (int i = 0; i < samples; i++) {
+    if (scale.is_ready()) {
+      double val = scale.get_units(1);
+      sum += val;
+      count++;
+    } else {
+      Serial.println("HX711 not ready");
+    }
+    delay(10);
+  }
+  if (count == 0) return 0.0;
+  return (float)(sum / count);
+}
+
+// ====== Setup ======
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== ESP32 Tamper Detection ===");
+
+  // pins
+  pinMode(REED_PIN, INPUT_PULLUP);  // Reed switch usually closed to GND when closed => use pullup
+  pinMode(VIB_PIN, INPUT);          // vibration module gives HIGH on vibration (depends on module)
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+
+  // default LED states
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  noTone(BUZZER_PIN);
+
+  // HX711 setup
+  scale.begin(HX_DT_PIN, HX_SCK_PIN);
+  scale.set_scale(HX_SCALE);    // set this to your calibration factor
+  scale.tare();                // reset to 0
+  HX_TARE_OFFSET = scale.read_average(20);
+  Serial.print("HX711 tare offset: "); Serial.println(HX_TARE_OFFSET);
+
+  // Save initial lastLoadValue
+  lastLoadValue = readLoadUnits(10);
+  Serial.print("Initial load units: "); Serial.println(lastLoadValue);
+
+  // MPU init
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found! Check wiring.");
+  } else {
+    Serial.println("MPU6050 started.");
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+  
+  // connect WiFi
+  wifiConnect();
+
+  // Set green LED on to indicate normal monitoring
+  digitalWrite(GREEN_LED, HIGH);
+}
+
+// ====== Loop ======
+void loop() {
+  // 1) Check reed switch (door open)
+  int reed = digitalRead(REED_PIN);
+  if (reed != lastReedState) {
+    unsigned long now = millis();
+    if (now - lastReedChange > REED_DEBOUNCE_MS) {
+      lastReedChange = now;
+      lastReedState = reed;
+      if (reed == HIGH) {
+        // assuming HIGH = open (depends on wiring); adjust if opposite
+        Serial.println("Reed: OPEN detected!");
+        digitalWrite(GREEN_LED, LOW);
+        alarmLocal(2500);
+        sendAlert("REED_OPEN", "Enclosure/door opened");
+      } else {
+        Serial.println("Reed: CLOSED");
+      }
+    }
+  }
+
+  // 2) Check vibration sensor (SW-420)
+  int vib = digitalRead(VIB_PIN);
+  if (vib != lastVibState) {
+    unsigned long now = millis();
+    if (now - lastVibChange > VIB_DEBOUNCE_MS) {
+      lastVibChange = now;
+      lastVibState = vib;
+      if (vib == HIGH) {
+        Serial.println("Vibration detected!");
+        digitalWrite(GREEN_LED, LOW);
+        alarmLocal(1500);
+        sendAlert("VIBRATION", "Shock or vibration detected (SW-420)");
+      }
+    }
+  }
+
+  // 3) Check MPU6050 for large movement/tilt
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  // compute acceleration magnitude difference from gravity (approx 9.8 m/s^2)
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+  float mag = sqrt(ax*ax + ay*ay + az*az);
+  float diff = fabs(mag - 9.80665); // magnitude above/below gravity
+  // Debug
+  // Serial.printf("MPU mag: %.2f diff: %.2f\n", mag, diff);
+  if (diff > MPU_ACCELERATION_THRESHOLD) {
+    Serial.printf("MPU movement/tilt detected (diff %.2f)\n", diff);
+    digitalWrite(GREEN_LED, LOW);
+    alarmLocal(2000);
+    sendAlert("MPU_MOVE", String("Accel mag diff: ") + String(diff, 2));
+  }
+
+  // 4) Check HX711 load cell for large change (possible tampering or calibration shift)
+  float loadNow = readLoadUnits(8);
+  float loadDiff = fabs(loadNow - lastLoadValue);
+  // Debug
+  Serial.printf("Load units: %.2f  diff: %.2f\n", loadNow, loadDiff);
+  // If change beyond threshold -> alert
+  if (loadDiff > LOAD_CHANGE_THRESHOLD) {
+    Serial.println("Load change threshold exceeded!");
+    digitalWrite(GREEN_LED, LOW);
+    alarmLocal(2000);
+    sendAlert("LOAD_DRIFT", String("Load change: ") + String(loadDiff, 2));
+    // update baseline after event (avoid immediate re-triggering)
+    lastLoadValue = loadNow;
+  } else {
+    // slowly update baseline to cope with drift (low-pass)
+    lastLoadValue = (lastLoadValue * 0.995) + (loadNow * 0.005);
+  }
+
+  // small delay - tune as needed
+  delay(400);
+}
